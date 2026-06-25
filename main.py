@@ -116,21 +116,29 @@ def scrape_google_maps(api_key: str) -> List[Dict]:
         for term in MAPS_TARGETS:
             query = f"{term} {county} County Michigan"
             try:
-                r = requests.get(
-                    "https://maps.googleapis.com/maps/api/place/textsearch/json",
-                    params={"query": query, "key": api_key},
+                r = requests.post(
+                    "https://places.googleapis.com/v1/places:searchText",
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Goog-Api-Key": api_key,
+                        "X-Goog-FieldMask": (
+                            "places.displayName,places.formattedAddress,"
+                            "places.rating,places.userRatingCount,places.id"
+                        ),
+                    },
+                    json={"textQuery": query, "maxResultCount": 6},
                     timeout=12,
                 )
-                results = r.json().get("results", [])[:6]
+                results = r.json().get("places", [])
                 log.info(f"Maps '{term}' / {county}: {len(results)} result(s)")
 
                 for place in results:
-                    name     = place.get("name", "")
-                    address  = place.get("formatted_address", "")
+                    name     = place.get("displayName", {}).get("text", "")
+                    address  = place.get("formattedAddress", "")
                     rating   = place.get("rating", None)
-                    reviews  = place.get("user_ratings_total", 0)
+                    reviews  = place.get("userRatingCount", 0)
                     city     = address.split(",")[1].strip() if "," in address else county
-                    place_id = place.get("place_id", "")
+                    place_id = place.get("id", "")
                     url      = (f"https://maps.google.com/?cid={place_id}"
                                 if place_id else
                                 f"https://maps.google.com/?q={requests.utils.quote(name)}")
