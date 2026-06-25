@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Paver Leads Bot
-Automated lead generation for hardscape/paver services.
-Covers: Oakland, Macomb, Lapeer, Livingston, St. Clair counties (Michigan)
-Outputs to Google Sheets.
+Paver Leads Bot v2
+Sources: Google Maps Places API | Realtor.com Recently Sold | BuildZoom Permit Records
+Counties: Oakland, Macomb, Lapeer, Livingston, St. Clair (Michigan)
 """
 
 import os
@@ -27,41 +26,34 @@ HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
 }
-
-KEYWORDS = [
-    "paver", "pavers", "brick patio", "brick driveway",
-    "patio pavers", "driveway pavers", "hardscape", "hardscaping",
-    "paver sealing", "paver repair", "power wash", "pressure wash",
-    "paver cleaning", "paver restoration", "retaining wall",
-]
-
-CLEANING_KW  = ["power wash", "pressure wash", "sealing", "cleaning", "restoration", "seal"]
-REPAIR_KW    = ["repair", "fix", "broken", "cracked", "damaged", "replace", "sinking", "settling"]
-INSTALL_KW   = ["install", "new", "build", "patio", "driveway", "walkway", "hardscape"]
-URGENCY_KW   = ["asap", "urgent", "soon", "immediately", "this week", "right away", "quickly", "today"]
-BUDGET_KW    = ["budget", "price", "quote", "estimate", "cost", "affordable", "reasonable", "how much"]
-VAGUE_KW     = ["maybe", "thinking about", "considering", "someday", "eventually", "not sure"]
-COMMERCIAL_KW = ["business", "commercial", "property management", "hoa", "association", "complex", "plaza", "center"]
 
 COUNTY_CITIES = {
-    "Oakland":    ["Pontiac", "Troy", "Birmingham", "Bloomfield", "Farmington Hills",
-                   "Auburn Hills", "Rochester", "Clarkston", "Waterford", "Novi", "Southfield"],
+    "Oakland":    ["Troy", "Birmingham", "Bloomfield Hills", "Auburn Hills",
+                   "Rochester Hills", "Clarkston", "Waterford", "Novi", "Southfield", "Pontiac"],
     "Macomb":     ["Warren", "Sterling Heights", "St. Clair Shores", "Roseville",
-                   "Clinton Township", "Chesterfield", "Shelby Township", "Utica", "Fraser"],
-    "Lapeer":     ["Lapeer", "Imlay City", "Almont", "Metamora", "Attica"],
-    "Livingston": ["Howell", "Brighton", "Hartland", "Pinckney", "Fowlerville", "Fenton"],
-    "St. Clair":  ["Port Huron", "Marysville", "St. Clair", "Marine City", "Algonac", "Kimball"],
+                   "Clinton Township", "Chesterfield", "Shelby Township", "Utica"],
+    "Lapeer":     ["Lapeer", "Imlay City", "Almont", "Metamora"],
+    "Livingston": ["Howell", "Brighton", "Hartland", "Pinckney"],
+    "St. Clair":  ["Port Huron", "Marysville", "St. Clair", "Marine City"],
 }
 
-CL_BASE = "https://detroit.craigslist.org"
+MAPS_TARGETS = [
+    "property management company",
+    "HOA homeowners association",
+    "commercial real estate",
+    "apartment complex",
+    "shopping plaza",
+    "office park",
+    "condominium association",
+]
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-7s  %(message)s")
-log = logging.getLogger(__name__)
-
-# ── Google Sheets helpers ────────────────────────────────────────────────────
+PERMIT_KEYWORDS = [
+    "patio", "paver", "driveway", "hardscape", "retaining wall", "brick paver",
+]
 
 SHEET_HEADERS = [
     "Date Found", "Source", "Title / Name", "Description",
@@ -70,9 +62,13 @@ SHEET_HEADERS = [
     "URL", "Status", "Notes",
 ]
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-7s  %(message)s")
+log = logging.getLogger(__name__)
+
+# ── Google Sheets ────────────────────────────────────────────────────────────
+
 def get_sheet():
-    creds_json = os.environ["SERVICE_ACCOUNT_JSON"]
-    creds_dict = json.loads(creds_json)
+    creds_dict = json.loads(os.environ["SERVICE_ACCOUNT_JSON"])
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -90,7 +86,7 @@ def ensure_headers(ws):
 
 def get_existing_urls(ws) -> set:
     try:
-        return set(ws.col_values(12)[1:])   # column L = URL
+        return set(ws.col_values(12)[1:])
     except Exception:
         return set()
 
@@ -99,156 +95,25 @@ def append_leads(ws, leads: List[Dict]):
     if not leads:
         log.info("No new leads to append.")
         return
-    rows = [
-        [
-            l["date_found"], l["source"], l["name"], l["description"],
-            l["county"], l["city"], l["service_type"], l["lead_type"],
-            l["motivation_score"], l["motivation_reason"], l["contact"],
-            l["url"], "New", "",
-        ]
-        for l in leads
-    ]
+    rows = [[
+        l["date_found"], l["source"], l["name"], l["description"],
+        l["county"], l["city"], l["service_type"], l["lead_type"],
+        l["motivation_score"], l["motivation_reason"], l["contact"],
+        l["url"], "New", "",
+    ] for l in leads]
     ws.append_rows(rows, value_input_option="USER_ENTERED")
-    log.info(f"Appended {len(rows)} new lead(s) to sheet.")
+    log.info(f"Appended {len(rows)} lead(s).")
 
-# ── Scoring & classification ─────────────────────────────────────────────────
-
-def detect_service_type(text: str) -> str:
-    t = text.lower()
-    types = []
-    if any(k in t for k in CLEANING_KW):
-        types.append("Cleaning/Sealing")
-    if any(k in t for k in REPAIR_KW):
-        types.append("Repair")
-    if any(k in t for k in INSTALL_KW):
-        types.append("Installation")
-    return " + ".join(types) or "General"
-
-
-def detect_county_city(text: str):
-    t = text.lower()
-    for county, cities in COUNTY_CITIES.items():
-        for city in cities:
-            if city.lower() in t:
-                return county, city
-    return "Unknown", "Unknown"
-
-
-def score_lead(text: str, source: str = "Craigslist"):
-    t = text.lower()
-    score = 3
-    reasons = [f"Active {source} post (high intent)"]
-
-    if any(k in t for k in URGENCY_KW):
-        score = min(5, score + 1)
-        reasons.append("Urgency language")
-    if any(k in t for k in BUDGET_KW):
-        score = min(5, score + 1)
-        reasons.append("Price/quote inquiry — ready to buy")
-    if any(k in t for k in VAGUE_KW):
-        score = max(1, score - 1)
-        reasons.append("Vague/exploratory language")
-
-    return score, "; ".join(reasons)
-
-# ── Craigslist scraper ───────────────────────────────────────────────────────
-
-def fetch_cl_detail(url: str) -> Dict:
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=12)
-        soup = BeautifulSoup(r.text, "html.parser")
-        body = soup.select_one("#postingbody")
-        desc = body.get_text(strip=True) if body else ""
-        desc = re.sub(r"QR Code Link to This Post\s*", "", desc).strip()
-        phone = re.search(r"\(?\d{3}\)?[\s\-\.]\d{3}[\s\-\.]\d{4}", desc)
-        contact = phone.group() if phone else ""
-        return {"description": desc, "contact": contact}
-    except Exception as e:
-        log.warning(f"  Detail fetch failed ({url}): {e}")
-        return {"description": "", "contact": ""}
-
-
-def scrape_craigslist() -> List[Dict]:
-    leads = []
-    seen_urls = set()
-
-    for keyword in KEYWORDS:
-        url = f"{CL_BASE}/search/swa?query={keyword.replace(' ', '+')}&sort=date"
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=12)
-            r.raise_for_status()
-            soup = BeautifulSoup(r.text, "html.parser")
-            results = soup.select("li.cl-static-search-result")
-            log.info(f"CL '{keyword}': {len(results)} result(s)")
-
-            for item in results:
-                try:
-                    title_el = item.select_one(".title")
-                    link_el  = item.select_one("a")
-                    if not title_el or not link_el:
-                        continue
-
-                    title    = title_el.get_text(strip=True)
-                    post_url = link_el.get("href", "")
-                    if not post_url.startswith("http"):
-                        post_url = CL_BASE + post_url
-
-                    if post_url in seen_urls:
-                        continue
-                    seen_urls.add(post_url)
-
-                    time.sleep(1.5)
-                    detail   = fetch_cl_detail(post_url)
-                    full     = title + " " + detail["description"]
-                    county, city = detect_county_city(full)
-                    svc_type = detect_service_type(full)
-                    score, reason = score_lead(full)
-
-                    if score < 3:
-                        continue
-
-                    leads.append({
-                        "date_found":       datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        "source":           "Craigslist",
-                        "name":             title,
-                        "description":      detail["description"][:350],
-                        "county":           county,
-                        "city":             city,
-                        "service_type":     svc_type,
-                        "lead_type":        "Commercial" if any(k in full.lower() for k in COMMERCIAL_KW) else "Residential",
-                        "motivation_score": score,
-                        "motivation_reason": reason,
-                        "contact":          detail["contact"],
-                        "url":              post_url,
-                    })
-
-                except Exception as e:
-                    log.warning(f"  Item parse error: {e}")
-
-            time.sleep(2)
-
-        except Exception as e:
-            log.error(f"CL search '{keyword}' failed: {e}")
-
-    return leads
-
-# ── Google Maps Places scraper ───────────────────────────────────────────────
+# ── Source 1: Google Maps Places ─────────────────────────────────────────────
 
 def scrape_google_maps(api_key: str) -> List[Dict]:
     if not api_key:
-        log.info("GOOGLE_MAPS_API_KEY not set — skipping Places search.")
+        log.info("GOOGLE_MAPS_API_KEY not set — skipping.")
         return []
 
     leads = []
-    search_terms = [
-        "property management company",
-        "HOA management Michigan",
-        "commercial property owner",
-        "real estate investment company",
-    ]
-
     for county in COUNTY_CITIES:
-        for term in search_terms:
+        for term in MAPS_TARGETS:
             query = f"{term} {county} County Michigan"
             try:
                 r = requests.get(
@@ -256,58 +121,192 @@ def scrape_google_maps(api_key: str) -> List[Dict]:
                     params={"query": query, "key": api_key},
                     timeout=12,
                 )
-                data = r.json()
-                for place in data.get("results", [])[:5]:
-                    name    = place.get("name", "")
-                    address = place.get("formatted_address", "")
-                    rating  = place.get("rating", 0)
-                    reviews = place.get("user_ratings_total", 0)
+                results = r.json().get("results", [])[:6]
+                log.info(f"Maps '{term}' / {county}: {len(results)} result(s)")
+
+                for place in results:
+                    name     = place.get("name", "")
+                    address  = place.get("formatted_address", "")
+                    rating   = place.get("rating", None)
+                    reviews  = place.get("user_ratings_total", 0)
+                    city     = address.split(",")[1].strip() if "," in address else county
+                    place_id = place.get("place_id", "")
+                    url      = (f"https://maps.google.com/?cid={place_id}"
+                                if place_id else
+                                f"https://maps.google.com/?q={requests.utils.quote(name)}")
 
                     score  = 3
-                    reason = "Commercial property/management target"
+                    reason = f"Commercial target — {term}"
                     if rating and rating < 3.5 and reviews > 10:
                         score  = 4
-                        reason = f"Low-rated ({rating}★, {reviews} reviews) — dissatisfied customer pool"
+                        reason += f"; Low-rated ({rating}★, {reviews} reviews) — dissatisfied client pool"
 
-                    city = address.split(",")[1].strip() if address.count(",") >= 1 else ""
                     leads.append({
-                        "date_found":       datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        "source":           "Google Maps",
-                        "name":             name,
-                        "description":      f"{term} | Rating: {rating}/5 ({reviews} reviews)",
-                        "county":           county,
-                        "city":             city,
-                        "service_type":     "General",
-                        "lead_type":        "Commercial",
-                        "motivation_score": score,
+                        "date_found":        datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "source":            "Google Maps",
+                        "name":              name,
+                        "description":       f"{term} | {rating or 'N/A'}★ ({reviews} reviews) | {address}",
+                        "county":            county,
+                        "city":              city,
+                        "service_type":      "General",
+                        "lead_type":         "Commercial",
+                        "motivation_score":  score,
                         "motivation_reason": reason,
-                        "contact":          address,
-                        "url":              f"https://maps.google.com/?q={requests.utils.quote(name + ' ' + county + ' Michigan')}",
+                        "contact":           address,
+                        "url":               url,
                     })
-                time.sleep(1)
-
+                time.sleep(0.5)
             except Exception as e:
-                log.error(f"Maps '{query}' failed: {e}")
+                log.error(f"Maps error '{query}': {e}")
+    return leads
 
+# ── Source 2: Realtor.com Recently Sold ──────────────────────────────────────
+
+def scrape_realtor_recently_sold() -> List[Dict]:
+    leads = []
+    for county, cities in COUNTY_CITIES.items():
+        for city in cities:
+            slug = city.replace(" ", "-")
+            url  = f"https://www.realtor.com/realestateandhomes-search/{slug}_MI/show-recently-sold"
+            try:
+                r    = requests.get(url, headers=HEADERS, timeout=15)
+                soup = BeautifulSoup(r.text, "html.parser")
+                script = soup.find("script", {"id": "__NEXT_DATA__"})
+                if not script:
+                    log.warning(f"Realtor.com: no data found for {city}")
+                    time.sleep(2)
+                    continue
+
+                data  = json.loads(script.string)
+                props = (
+                    data.get("props", {})
+                        .get("pageProps", {})
+                        .get("searchResults", {})
+                        .get("home_search", {})
+                        .get("results", [])
+                )
+                log.info(f"Realtor.com {city}: {len(props)} listing(s)")
+
+                for prop in props[:8]:
+                    addr     = prop.get("location", {}).get("address", {})
+                    street   = addr.get("line", "")
+                    city_val = addr.get("city", city)
+                    price    = prop.get("list_price") or prop.get("last_sold_price") or 0
+                    sold_dt  = prop.get("last_sold_date", "N/A")
+                    beds     = prop.get("description", {}).get("beds", "N/A")
+                    sqft     = prop.get("description", {}).get("sqft", "N/A")
+                    prop_url = prop.get("permalink", "") or url
+                    if prop_url and not prop_url.startswith("http"):
+                        prop_url = "https://www.realtor.com" + prop_url
+
+                    score  = 4
+                    reason = "Recently sold — new homeowner, peak renovation window (first 90 days)"
+                    if price and price > 400_000:
+                        score  = 5
+                        reason += f"; Premium home (${price:,}) — strong hardscape investment likelihood"
+
+                    leads.append({
+                        "date_found":        datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "source":            "Realtor.com Recently Sold",
+                        "name":              f"{street}, {city_val}, MI",
+                        "description":       f"Sold: {sold_dt} | Price: ${price:,} | Beds: {beds} | SqFt: {sqft}",
+                        "county":            county,
+                        "city":              city_val,
+                        "service_type":      "Installation / General",
+                        "lead_type":         "Residential",
+                        "motivation_score":  score,
+                        "motivation_reason": reason,
+                        "contact":           "",
+                        "url":               prop_url,
+                    })
+                time.sleep(2)
+            except Exception as e:
+                log.error(f"Realtor.com error '{city}': {e}")
+    return leads
+
+# ── Source 3: BuildZoom Permit Records ───────────────────────────────────────
+
+def _permit_service_type(keyword: str) -> str:
+    if keyword in ("paver", "brick paver", "hardscape"):
+        return "Installation"
+    if keyword == "driveway":
+        return "Installation / Repair"
+    if keyword == "retaining wall":
+        return "Installation"
+    return "General"
+
+
+def scrape_permit_records() -> List[Dict]:
+    leads = []
+    for county in COUNTY_CITIES:
+        for keyword in PERMIT_KEYWORDS:
+            query = f"{keyword} {county} County Michigan"
+            url   = f"https://www.buildzoom.com/permits?q={requests.utils.quote(query)}"
+            try:
+                r    = requests.get(url, headers=HEADERS, timeout=15)
+                soup = BeautifulSoup(r.text, "html.parser")
+
+                items = (
+                    soup.select(".permit-item")
+                    or soup.select("[data-permit]")
+                    or soup.select("article.permit")
+                    or soup.select("li.result")
+                    or soup.select("div.result-card")
+                )
+                log.info(f"Permits '{keyword}' / {county}: {len(items)} result(s)")
+
+                for item in items[:5]:
+                    text     = item.get_text(separator=" ", strip=True)
+                    addr_el  = item.select_one(".address, [data-address], .location")
+                    address  = addr_el.get_text(strip=True) if addr_el else text[:80]
+
+                    city_match = next(
+                        (c for c in COUNTY_CITIES[county] if c.lower() in text.lower()),
+                        county
+                    )
+                    item_url = url
+                    link = item.select_one("a[href]")
+                    if link:
+                        href = link.get("href", "")
+                        item_url = href if href.startswith("http") else "https://www.buildzoom.com" + href
+
+                    leads.append({
+                        "date_found":        datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "source":            "Permit Records",
+                        "name":              address,
+                        "description":       f"Permit keyword: {keyword} | {text[:250]}",
+                        "county":            county,
+                        "city":              city_match,
+                        "service_type":      _permit_service_type(keyword),
+                        "lead_type":         "Residential",
+                        "motivation_score":  5,
+                        "motivation_reason": "Active building permit — outdoor project in progress or imminent",
+                        "contact":           "",
+                        "url":               item_url,
+                    })
+                time.sleep(1.5)
+            except Exception as e:
+                log.error(f"Permit error '{keyword}' / {county}: {e}")
     return leads
 
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 def main():
     log.info("═" * 55)
-    log.info("Paver Leads Bot — starting run")
+    log.info("Paver Leads Bot v2 — starting run")
     log.info("═" * 55)
 
     ws = get_sheet()
     ensure_headers(ws)
     existing_urls = get_existing_urls(ws)
 
-    all_leads = []
-    all_leads.extend(scrape_craigslist())
+    all_leads: List[Dict] = []
     all_leads.extend(scrape_google_maps(os.environ.get("GOOGLE_MAPS_API_KEY", "")))
+    all_leads.extend(scrape_realtor_recently_sold())
+    all_leads.extend(scrape_permit_records())
 
     new_leads = [l for l in all_leads if l["url"] not in existing_urls]
-    log.info(f"Total leads found: {len(all_leads)} | New (deduped): {len(new_leads)}")
+    log.info(f"Total: {len(all_leads)} found | {len(new_leads)} new after dedup")
 
     append_leads(ws, new_leads)
     log.info("Run complete.")
